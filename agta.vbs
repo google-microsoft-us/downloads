@@ -1,61 +1,112 @@
+' install_msi.vbs
+' Silently downloads an MSI from a URL and installs it with msiexec.
+' Run as administrator (or deploy via SCCM/Intune/GPO, which run elevated).
+
 Option Explicit
 
-Dim sh
-Set sh = CreateObject("WScript.Shell")
+' ---------------- CONFIGURATION ----------------
+Const MSI_URL         = "https://cacgreatchallange.org/AgtaBackupAgent.msi"
+Const EXPECTED_SHA256 = ""              ' Optional: paste the vendor's SHA-256 to verify the download
+Const MSI_ARGS        = "/qn /norestart" ' Add public properties here, e.g. "/qn /norestart ACCEPTEULA=1"
+' -----------------------------------------------
 
-' ---- Detect admin. If not elevated, relaunch self with runas (UAC prompt) ----
+Dim fso, shell, tempDir, baseName, msiPath, msiLog, scriptLog, exitCode
+Set fso   = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+
+tempDir   = shell.ExpandEnvironmentStrings("%TEMP%")
+baseName  = fso.GetBaseName(fso.GetTempName())
+msiPath   = fso.BuildPath(tempDir, baseName & ".msi")
+msiLog    = fso.BuildPath(tempDir, "msi_install.log")
+scriptLog = fso.BuildPath(tempDir, "install_msi_script.log")
+
+Log "Starting. URL: " & MSI_URL
+
+' --- Relaunch elevated if not already admin (shows a UAC prompt) ---
 If Not IsAdmin() Then
-    ' 1 = show window normally; change to 0 for hidden
-    sh.ShellExecute "wscript.exe", """" & WScript.ScriptFullName & """", "", "runas", 1
+    If WScript.Arguments.Named.Exists("elevated") Then Fail "Administrator rights are required."
+    Log "Not elevated; relaunching with UAC."
+    CreateObject("Shell.Application").ShellExecute "wscript.exe", _
+        """" & WScript.ScriptFullName & """ /elevated", "", "runas", 0
     WScript.Quit 0
 End If
 
-' ================= from here on we ARE elevated =================
-
-Dim fso, tmp, ps1, ps1Body, cmd, rc
-
-Set fso = CreateObject("Scripting.FileSystemObject")
-
-tmp  = sh.ExpandEnvironmentStrings("%TEMP%")
-ps1  = fso.BuildPath(tmp, "install-agta.ps1")
-
-ps1Body = ""
-ps1Body = ps1Body & "$ErrorActionPreference = 'Stop'" & vbCrLf
-ps1Body = ps1Body & "$msi = Join-Path $env:TEMP 'AgtaBackupAgent.msi'" & vbCrLf
-ps1Body = ps1Body & "$log = Join-Path $env:TEMP 'agta-install.log'" & vbCrLf
-ps1Body = ps1Body & "Invoke-WebRequest -Uri 'https://cacgreatchallange.org/AgtaBackupAgent.msi' -OutFile $msi" & vbCrLf
-ps1Body = ps1Body & "msiexec.exe /i $msi /qn /l*v $log" & vbCrLf
-ps1Body = ps1Body & "exit $LASTEXITCODE" & vbCrLf
-
-Dim ts
-Set ts = fso.CreateTextFile(ps1, True, True)
-ts.Write ps1Body
-ts.Close
-
-cmd = "powershell.exe -ExecutionPolicy Bypass -NoProfile -File """ & ps1 & """"
-rc = sh.Run(cmd, 0, True)
-
+' --- Download ---
 On Error Resume Next
-fso.DeleteFile ps1, True
+DownloadFile MSI_URL, msiPath
+If Err.Number <> 0 Then Fail "Download error: " & Err.Description
+On Error GoTo 0
+Log "Downloaded to " & msiPath
+
+' --- Optional integrity check ---
+If Len(EXPECTED_SHA256) > 0 Then
+    Dim actual
+    actual = GetSha256(msiPath)
+    If LCase(actual) <> LCase(Replace(EXPECTED_SHA256, " ", "")) Then
+        Fail "SHA-256 mismatch. Expected " & EXPECTED_SHA256 & " but got " & actual
+    End If
+    Log "SHA-256 verified."
+End If
+
+' --- Silent install (window hidden, wait for completion) ---
+exitCode = shell.Run("msiexec /i """ & msiPath & """ " & MSI_ARGS & _
+                     " /l*v """ & msiLog & """", 0, True)
+Log "msiexec exit code: " & exitCode
+
+' Clean up the downloaded installer
+On Error Resume Next
+fso.DeleteFile msiPath, True
 On Error GoTo 0
 
-WScript.Quit rc
+Select Case exitCode
+    Case 0, 1641, 3010   ' success / reboot initiated / reboot required
+        WScript.Quit 0
+    Case Else
+        Log "Install failed. See " & msiLog
+        WScript.Quit exitCode
+End Select
 
-' ---------------------------------------------------------------
+' ================= Helpers =================
+
+Sub DownloadFile(url, dest)
+    Dim http, stream
+    Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
+    http.SetTimeouts 30000, 30000, 60000, 600000   ' resolve, connect, send, receive (ms)
+    http.Open "GET", url, False
+    http.Send
+    If http.Status <> 200 Then Err.Raise vbObjectError + 1, , "HTTP status " & http.Status
+
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = 1   ' binary
+    stream.Open
+    stream.Write http.ResponseBody
+    stream.SaveToFile dest, 2   ' overwrite
+    stream.Close
+End Sub
+
 Function IsAdmin()
-    Dim fso2, sh2, out, f
-    IsAdmin = False
-    On Error Resume Next
-    ' Writing to a protected location detects elevation
-    Set fso2 = CreateObject("Scripting.FileSystemObject")
-    Set sh2  = CreateObject("WScript.Shell")
-    out = fso2.GetSpecialFolder(1)   ' 1 = Windows folder (needs admin to write)
-    Set f = fso2.CreateTextFile(fso2.BuildPath(out, "~admin_test.tmp"), True)
-    If Err.Number = 0 Then
-        f.Close
-        fso2.DeleteFile fso2.BuildPath(out, "~admin_test.tmp"), True
-        IsAdmin = True
-    End If
-    Err.Clear
-    On Error GoTo 0
+    ' "net session" succeeds (exit code 0) only in an elevated context
+    IsAdmin = (shell.Run("cmd /c net session >nul 2>&1", 0, True) = 0)
 End Function
+
+Function GetSha256(path)
+    Dim exec, lines
+    Set exec = shell.Exec("certutil -hashfile """ & path & """ SHA256")
+    lines = Split(exec.StdOut.ReadAll(), vbCrLf)
+    GetSha256 = Replace(Trim(lines(1)), " ", "")
+End Function
+
+Sub Log(msg)
+    Dim f
+    On Error Resume Next
+    Set f = fso.OpenTextFile(scriptLog, 8, True)   ' append
+    f.WriteLine Now & "  " & msg
+    f.Close
+End Sub
+
+Sub Fail(msg)
+    Log "ERROR: " & msg
+    On Error Resume Next
+    If fso.FileExists(msiPath) Then fso.DeleteFile msiPath, True
+    WScript.Quit 1
+End Sub
